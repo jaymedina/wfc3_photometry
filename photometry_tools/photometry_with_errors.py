@@ -53,7 +53,11 @@ Use
 import numpy as np
 from astropy.table import Table
 from .background_median import aperture_stats_tbl
+
+from astropy.stats import sigma_clipped_stats
 from photutils import aperture_photometry
+from photutils import CircularAperture
+from photutils import DAOStarFinder
 
 def iraf_style_photometry(
         phot_apertures,
@@ -130,6 +134,100 @@ def iraf_style_photometry(
 
     final_tbl = Table(data=stacked, names=names)
     return final_tbl
+
+def all_radii(
+        radii,
+        bg_apertures,
+        data,
+        error_array=None,
+        bg_method='mode',
+        epadu=1.0):
+    """Computes photometry with PhotUtils apertures, with IRAF formulae
+
+    Parameters
+    ----------
+    radii : list
+        The list of aperture sizes (in pixels) that will encapsulate the
+        sources. Photometry is calculated at each aperture size.
+    bg_apertures : photutils PixelAperture object (or subclass)
+        The phoutils aperture object to measure the background in.
+        i.e. the object returned via CircularAnnulus.
+    data : array
+        The data for the image to be measured.
+    error_array: array, optional
+        The array of pixelwise error of the data.  If none, the
+        Poisson noise term in the error computation will just be the
+        square root of the flux/epadu. If not none, the
+        aperture_sum_err column output by aperture_photometry
+        (divided by epadu) will be used as the Poisson noise term.
+    bg_method: {'mean', 'median', 'mode'}, optional
+        The statistic used to calculate the background.
+        All measurements are sigma clipped.
+        NOTE: From DAOPHOT, mode = 3 * median - 2 * mean.
+    epadu: float, optional
+        Gain in electrons per adu (only use if image units aren't e-).
+
+    Returns
+    -------
+    final_tbl : astropy.table.Table
+        An astropy Table with the colums X, Y, flux, flux_error, mag,
+        and mag_err measurements for each of the sources.
+
+    """
+    if bg_method not in ['mean', 'median', 'mode']:
+        raise ValueError('Invalid background method, choose either \
+                          mean, median, or mode')
+
+    fluxes, fluxerrs, mags, magerrs = [], [], [], []
+    for radius in radii:
+        # Masking nans
+        mask = np.isnan(data)
+        mean, median, std = sigma_clipped_stats(data, mask=mask, sigma=3.0, \
+                                                iters=5)
+
+        thresh  = 45.0
+        x       = DAOStarFinder(threshold=thresh*std,fwhm=3.0)
+        sources = x.find_stars(data-median)
+
+        positions = (sources['xcentroid'], sources['ycentroid'])
+        phot_apertures = CircularAperture(positions, r=radius)
+
+        phot = aperture_photometry(data, phot_apertures, error=error_array)
+        bg_phot = aperture_stats_tbl(data, bg_apertures, sigma_clip=True)
+
+        ap_area = phot_apertures.area()
+        bg_method_name = 'aperture_{}'.format(bg_method)
+
+        flux = phot['aperture_sum'] - bg_phot[bg_method_name] * ap_area
+
+    # Need to use variance of the sources
+    # for Poisson noise term in error computation.
+    #
+    # This means error needs to be squared.
+    # If no error_array error = flux ** .5
+        if error_array is not None:
+            flux_error = compute_phot_error(phot['aperture_sum_err']**2.0,
+                                            bg_phot, bg_method, ap_area,
+                                            epadu)
+        else:
+            flux_error = compute_phot_error(flux, bg_phot,
+                                            bg_method, ap_area, epadu)
+
+        mag = -2.5 * np.log10(flux)
+        mag_err = 1.0857 * flux_error / flux
+
+        fluxes.append(flux)
+        fluxerrs.append(flux_error)
+        mags.append(mag)
+        magerrs.append(mag_err)
+
+    # Make the final table
+    X, Y = phot_apertures.positions.T
+    #stacked = np.stack([X, Y, fluxes, fluxerrs, mags, magerrs], axis=1)
+    #names = ['X', 'Y', 'flux', 'flux_error', 'mag', 'mag_error']
+
+    #final_tbl = Table(data=stacked, names=names)
+    #return final_tbl
 
 def compute_phot_error(
         flux_variance,
