@@ -52,7 +52,8 @@ Use
 
 import numpy as np
 from astropy.table import Table
-from .background_median import aperture_stats_tbl
+#from .background_median import aperture_stats_tbl
+from background_median import aperture_stats_tbl
 
 from astropy.stats import sigma_clipped_stats
 from photutils import aperture_photometry
@@ -143,6 +144,7 @@ def all_radii(
         bg_method='mode',
         epadu=1.0):
     """Computes photometry with PhotUtils apertures, with IRAF formulae
+    NOTE: Only works if there is only 1 source in the field
 
     Parameters
     ----------
@@ -228,6 +230,38 @@ def all_radii(
 
     #final_tbl = Table(data=stacked, names=names)
     #return final_tbl
+
+def make_aper(data, sig, iterations, thresh, fwhm):
+    """Generates the computed apertures object that is used in
+    iraf_style_photometry and all_radii
+
+    Parameters
+    ----------
+    data : array
+        The data for the image to be measured.
+    sig : int
+        The sigma value threshold used for sigma-clipping the sky background.
+    iterations : int
+        The number of iterations desired for sigm-clipping the sky background.
+    thresh : int
+        The upper limit of
+    fwhm : int
+        The full width half max.
+
+    Returns
+    -------
+    apertures : photutils PixelAperture object (or subclass)
+        The PhotUtils apertures object to compute the photometry.
+    """
+
+    mask = np.isnan(data)
+    mean, median, std = sigma_clipped_stats(data, mask=mask, sigma=sig, \
+                                            iters=iterations)
+    threshold = thresh
+    x = DAOStarFinder(threshold=threshold*std, fwhm=fwhm)
+    sources = x.find_stars(data-median)
+    positions = (sources['xcentroid'], source['ycentroid'])
+    apertures = CircularAperture(positions, r=radius)
 
 def compute_phot_error(
         flux_variance,
