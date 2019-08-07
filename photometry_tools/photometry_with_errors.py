@@ -58,6 +58,7 @@ from background_median import aperture_stats_tbl
 from astropy.stats import sigma_clipped_stats
 from photutils import aperture_photometry
 from photutils import CircularAperture
+from photutils import CircularAnnulus
 from photutils import DAOStarFinder
 
 def iraf_style_photometry(
@@ -136,6 +137,82 @@ def iraf_style_photometry(
     final_tbl = Table(data=stacked, names=names)
     return final_tbl
 
+def no_table(
+        phot_apertures,
+        bg_apertures,
+        data,
+        error_array=None,
+        bg_method='mode',
+        epadu=1.0):
+    """Computes photometry with PhotUtils apertures, with IRAF formulae
+
+    Parameters
+    ----------
+    phot_apertures : photutils PixelAperture object (or subclass)
+        The PhotUtils apertures object to compute the photometry.
+        i.e. the object returned via CirularAperture.
+    bg_apertures : photutils PixelAperture object (or subclass)
+        The phoutils aperture object to measure the background in.
+        i.e. the object returned via CircularAnnulus.
+    data : array
+        The data for the image to be measured.
+    error_array: array, optional
+        The array of pixelwise error of the data.  If none, the
+        Poisson noise term in the error computation will just be the
+        square root of the flux/epadu. If not none, the
+        aperture_sum_err column output by aperture_photometry
+        (divided by epadu) will be used as the Poisson noise term.
+    bg_method: {'mean', 'median', 'mode'}, optional
+        The statistic used to calculate the background.
+        All measurements are sigma clipped.
+        NOTE: From DAOPHOT, mode = 3 * median - 2 * mean.
+    epadu: float, optional
+        Gain in electrons per adu (only use if image units aren't e-).
+
+    Returns
+    -------
+    final_tbl : astropy.table.Table
+        An astropy Table with the colums X, Y, flux, flux_error, mag,
+        and mag_err measurements for each of the sources.
+
+    """
+
+    if bg_method not in ['mean', 'median', 'mode']:
+        raise ValueError('Invalid background method, choose either \
+                          mean, median, or mode')
+
+    phot = aperture_photometry(data, phot_apertures, error=error_array)
+    bg_phot = aperture_stats_tbl(data, bg_apertures, sigma_clip=True)
+
+    ap_area = phot_apertures.area()
+    bg_method_name = 'aperture_{}'.format(bg_method)
+
+    flux = phot['aperture_sum'] - bg_phot[bg_method_name] * ap_area
+
+    # Need to use variance of the sources
+    # for Poisson noise term in error computation.
+    #
+    # This means error needs to be squared.
+    # If no error_array error = flux ** .5
+    if error_array is not None:
+        flux_error = compute_phot_error(phot['aperture_sum_err']**2.0,
+                                        bg_phot, bg_method, ap_area,
+                                        epadu)
+    else:
+        flux_error = compute_phot_error(flux, bg_phot,
+                                        bg_method, ap_area, epadu)
+
+    mag = -2.5 * np.log10(flux)
+    mag_err = 1.0857 * flux_error / flux
+
+    # Make the final table
+    X, Y = phot_apertures.positions.T
+    stacked = np.stack([X, Y, flux, flux_error, mag, mag_err], axis=1)
+    names = ['X', 'Y', 'flux', 'flux_error', 'mag', 'mag_error']
+
+    final_tbl = Table(data=stacked, names=names)
+    return np.asarray(flux), np.asarray(flux_error)
+
 def all_radii(
         radii,
         bg_apertures,
@@ -182,17 +259,7 @@ def all_radii(
 
     fluxes, fluxerrs, mags, magerrs = [], [], [], []
     for radius in radii:
-        # Masking nans
-        mask = np.isnan(data)
-        mean, median, std = sigma_clipped_stats(data, mask=mask, sigma=3.0, \
-                                                iters=5)
-
-        thresh  = 45.0
-        x       = DAOStarFinder(threshold=thresh*std,fwhm=3.0)
-        sources = x.find_stars(data-median)
-
-        positions = (sources['xcentroid'], sources['ycentroid'])
-        phot_apertures = CircularAperture(positions, r=radius)
+        phot_apertures = make_aper()
 
         phot = aperture_photometry(data, phot_apertures, error=error_array)
         bg_phot = aperture_stats_tbl(data, bg_apertures, sigma_clip=True)
@@ -231,7 +298,7 @@ def all_radii(
     #final_tbl = Table(data=stacked, names=names)
     #return final_tbl
 
-def make_aper(data, sig, iterations, thresh, fwhm):
+def make_aper(data, radius, thresh, sig=3.0, iterations=10, fwhm=3.0):
     """Generates the computed apertures object that is used in
     iraf_style_photometry and all_radii
 
@@ -239,19 +306,25 @@ def make_aper(data, sig, iterations, thresh, fwhm):
     ----------
     data : array
         The data for the image to be measured.
-    sig : int
-        The sigma value threshold used for sigma-clipping the sky background.
-    iterations : int
-        The number of iterations desired for sigm-clipping the sky background.
+    radius : int
+        The radius of the aperture that will encapsulate the source.
     thresh : int
-        The upper limit of
-    fwhm : int
-        The full width half max.
+        The upper limit of idk.
+    sig : int (optional)
+        The sigma value threshold used for sigma-clipping the sky background.
+        Default = 3.0.
+    iterations : int (optional)
+        The number of iterations desired for sigma-clipping the sky background.
+        Default = 3.0.
+    fwhm : int (optional)
+        The full width half max. Default = 3.0.
 
     Returns
     -------
     apertures : photutils PixelAperture object (or subclass)
         The PhotUtils apertures object to compute the photometry.
+    annuluses :
+        The SkyAnnulus for the sky background subtraction.
     """
 
     mask = np.isnan(data)
@@ -260,8 +333,13 @@ def make_aper(data, sig, iterations, thresh, fwhm):
     threshold = thresh
     x = DAOStarFinder(threshold=threshold*std, fwhm=fwhm)
     sources = x.find_stars(data-median)
-    positions = (sources['xcentroid'], source['ycentroid'])
+    positions = (sources['xcentroid'], sources['ycentroid'])
+    # Getting the apertures for the sources
     apertures = CircularAperture(positions, r=radius)
+    # Getting the annulus for sky background subtraction
+    annuluses = CircularAnnulus(positions, r_in=150, r_out=200)
+
+    return apertures, annuluses
 
 def compute_phot_error(
         flux_variance,
